@@ -1065,6 +1065,42 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             }
         }
     }
+    // LOCAL (KVMem query span, 2026-10-02, D-12): the retrieval query is the LAST USER TURN -- the
+    // official service-layer rule ("官方捕获整个被标记的 query span（服务层口径：取最后一轮 role=user）",
+    // docs: 02-交接与状态\KVMem-移植-交接-20260921.md:308). The frontiers below are already in TOKEN
+    // space, so this is one pass over data that already exists: no re-tokenization, no new machinery.
+    // Consumed by ops/kvmem/kvmem_score.h, which intersects it with each prefill chunk and skips the
+    // chunks that do not contain it. Message i spans [boundaries[i], boundaries[i+1]); a missing
+    // boundaries[0] means "starts at 0" (same convention as the ngram loop above).
+    for (std::size_t i = 0; i < message_roles.size() && i + 1 < message_boundaries.size(); ++i) {
+        if (message_roles[i] != ChatRole::User) { continue; }
+        if (!message_boundaries[i] && i != 0) { continue; }
+        if (!message_boundaries[i + 1]) { continue; }
+        std::int32_t begin = message_boundaries[i] ? static_cast<std::int32_t>(*message_boundaries[i]) : 0;
+        std::int32_t end   = static_cast<std::int32_t>(*message_boundaries[i + 1]);
+        // Trim the message FRAME, not just the roles: the upstream default span is the message's
+        // CONTENT (it renders the prompt twice -- once with this message emptied -- and takes the
+        // prefix-diff, so "<|im_start|>user\n" and the trailing markers are NOT part of it,
+        // refs kvmem-qw3-main/src/qw3_server.cpp:4779-4804). Same trim rule as the ngram loop above.
+        const std::span<const TokenId> all(result.token_ids);
+        if (begin < end && end <= static_cast<std::int32_t>(all.size()) &&
+            impl_->tokenizer->decode_token_bytes(all[static_cast<std::size_t>(begin)]) ==
+                "<|im_start|>") {
+            while (begin < end) {
+                const auto bytes =
+                    impl_->tokenizer->decode_token_bytes(all[static_cast<std::size_t>(begin++)]);
+                if (bytes.find('\n') != std::string_view::npos) { break; }
+            }
+        }
+        result.query_span_begin = begin;
+        result.query_span_end   = end;
+    }
+    // Publish unconditionally -- the -1 default included: a request that yields no user turn must CLEAR
+    // a stale span instead of inheriting the previous request's. That inheritance is exactly how a
+    // cached-prefix turn 2 ran on turn 1's prompt-wide span on 2026-10-02 and silently lost the content
+    // ranking. Publishing HERE, in the request path, also covers prefill shapes that never pass through
+    // program/prefill.cpp's driver (e.g. the forced-token suffix prefill in transactions/commit.cpp).
+    kvmem_publish_query_span(result.query_span_begin, result.query_span_end);
     result.identity.reusable = true;
     result.tap_hints         = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
                                                  engine_tool_marker_index, leading_boundary,
