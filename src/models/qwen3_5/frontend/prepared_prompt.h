@@ -29,6 +29,24 @@ struct ToolCallOutputContract;
 // -1/-1 = unknown -> the scorer keeps its tail rule.
 void kvmem_publish_query_span(std::int32_t begin, std::int32_t end) noexcept;
 
+// LOCAL (ActKV Sec. 8.1 semantic protection, 2026-10-16): publish this request's two never-compress
+// spans -- the leading system/developer instruction block, and the current user task -- in the same
+// absolute TOKEN indices the query span uses. Declared here and defined in program/prefill.cpp for
+// exactly the reason above: the frontend already knows both frontiers (it computes the query span
+// from them) and must not grow a CUDA/ops include to reach the scorer.
+//
+// The current user task is passed separately from the query span on purpose even though the two are
+// the same span today. They answer different questions: the query span is "what to rank against",
+// the protected task span is "what must never be evicted", and upstream keeps them separate, so a
+// later change to the ranking query cannot silently move the protection.
+//
+// Published unconditionally on every request, -1 included: a request with no instruction prefix or
+// no user turn must CLEAR a stale span rather than inherit the previous request's (the same
+// inheritance bug already recorded for the query span).
+void kvmem_publish_protect_spans(std::int32_t instruction_begin, std::int32_t instruction_end,
+                                 std::int32_t task_begin, std::int32_t task_end,
+                                 std::int32_t total_tokens) noexcept;
+
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
 // Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple

@@ -6,7 +6,8 @@
 #   subdirectory's sources.cmake -- so this file names the twelve translation units of the component
 #   that compile into ninfer_ops. Headers here are header-only and compile through their includers,
 #   so they are not listed: kvmem_score.h (inline accumulator), kvmem_window.h, kvmem_window_plan.h,
-#   kvmem_shadow.h, raw_k_block_arena.h and the qw3 .hpp policy layer.
+#   kvmem_select_actkv.h (ActKV LRFU + semantic protection, inline), kvmem_shadow.h,
+#   raw_k_block_arena.h and the qw3 .hpp policy layer.
 #
 # REQUIRED COMPANION LINE (in ops/CMakeLists.txt, beside this include):
 #   target_include_directories(ninfer_ops PRIVATE ${PROJECT_SOURCE_DIR}/src/ops/kvmem)

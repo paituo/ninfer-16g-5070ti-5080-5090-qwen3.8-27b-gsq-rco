@@ -1101,6 +1101,31 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // ranking. Publishing HERE, in the request path, also covers prefill shapes that never pass through
     // program/prefill.cpp's driver (e.g. the forced-token suffix prefill in transactions/commit.cpp).
     kvmem_publish_query_span(result.query_span_begin, result.query_span_end);
+    // LOCAL (ActKV Sec. 8.1 semantic protection, 2026-10-16): the leading system/developer
+    // instruction block starts at token 0 and ends where the first non-instruction message begins.
+    // `leading_boundary` is the message index of that first message (frontend.cpp:392), computed
+    // above for the tap hints; the token frontier is its entry in `message_boundaries`. A missing
+    // entry means the message did not survive rendering, in which case the prefix ends at the next
+    // known frontier rather than being guessed.
+    {
+        std::int32_t instruction_begin = -1;
+        std::int32_t instruction_end   = -1;
+        if (leading_boundary && *leading_boundary < message_boundaries.size()) {
+            for (std::size_t i = *leading_boundary; i < message_boundaries.size(); ++i) {
+                if (message_boundaries[i]) {
+                    instruction_begin = 0;
+                    instruction_end   = static_cast<std::int32_t>(*message_boundaries[i]);
+                    break;
+                }
+            }
+        }
+        // The current user task is the SAME span the query uses (see the query-span loop above), but
+        // it is published separately: the two answer different questions, and a later change to the
+        // ranking query must not silently move what is protected.
+        kvmem_publish_protect_spans(
+            instruction_begin, instruction_end, result.query_span_begin, result.query_span_end,
+            static_cast<std::int32_t>(result.token_ids.size()));
+    }
     result.identity.reusable = true;
     result.tap_hints         = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
                                                  engine_tool_marker_index, leading_boundary,

@@ -48,6 +48,8 @@
 //   prevent: the index is not re-based when the history grows, so a caller holding a score array that
 //   starts part-way through the sequence must say so rather than silently shifting every score.
 
+#include "ops/kvmem/kvmem_select_actkv.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -74,6 +76,26 @@ struct KvMemSelectResult {
     std::int32_t               candidates   = 0;  // middle blocks considered
 };
 
+// Optional ActKV policy inputs. A NULL `actkv` on every entry point below means "feature off" and
+// the ranking input is exactly the caller's `scores` array -- byte-identical to the behaviour
+// before this struct existed. That is the negative control, and it is the default.
+//
+// When `actkv` is non-null:
+//   * `lrfu` (optional, may be null) replaces the ranking key with the accumulated keep score.
+//     The evidence for the round must already have been handed to the state via
+//     `LrfuState::begin_round`; the caller commits the result with `LrfuState::commit(kept)` after
+//     this call returns. Doing it in that order is not a style choice -- see the two-phase comment
+//     in kvmem_select_actkv.h.
+//   * `protected_pages` are rescued on demand: only the ones this selection DROPPED are added
+//     back, best score first, at most `protect_cap(budget_blocks)` of them.
+struct KvMemActKvInputs {
+    const actkv::LrfuState*                         lrfu = nullptr;
+    const std::vector<std::uint32_t>*               protected_pages = nullptr;
+    // Optional diagnostic sink: when non-null the rescue writes one line per round. Set from the
+    // caller's environment switch; never read here (single read-point discipline).
+    bool                                            trace = false;
+};
+
 // Select the blocks to keep.
 //
 // `scores` must hold at least `total_blocks - first_block` floats, where index i is the score of
@@ -97,6 +119,7 @@ struct KvMemSelectResult {
 // answer bug that invariant exists to catch.
 [[nodiscard]] KvMemSelectResult kvmem_select_blocks(const KvMemSelectConfig& config,
                                                      const float*             scores,
-                                                     std::int32_t             first_block);
+                                                     std::int32_t             first_block,
+                                                     const KvMemActKvInputs&  actkv = {});
 
 } // namespace ninfer::ops

@@ -105,6 +105,177 @@ inline bool kvmem_score_env_flag(const char* name, bool fallback) noexcept {
     return std::strtol(v, nullptr, 10) != 0;
 }
 
+// ---- ★ ActKV (arXiv:2609.31395) retention policy -------------------------------------------------
+//
+// The two mechanisms ActKV v1.3 kept and measured -- LRFU retention (Sec. 5.2) and semantic
+// protection (Sec. 8.1). Switch AND environment are read HERE and nowhere else, the same
+// single-read-point discipline the rest of this header follows.
+//
+// NAMING: this fork drives KVMem through `NINFER_KV_*` environment variables rather than the
+// upstream `--kvmem-*` option family (`grep -c "kvmem" serve_options.cpp` is 0 here, and the whole
+// KVMem component predates the CLI). The ActKV switches therefore follow the environment
+// convention already established by their neighbours (`NINFER_TERNARY_KVMEM_SCORE*`, single read
+// point in this file) instead of inventing a second, parallel option family. The upstream option
+// spellings are recorded in each comment so the two backends can still be compared.
+//
+// OFF IS BIT-IDENTICAL. With `action_lrfu` off the ranking input is the raw retrieval score and
+// `begin_round`/`commit` are never called; with `protect_semantics` off no protected page is ever
+// computed or consulted. Both default to off, so the engine reproduces its previous readings
+// exactly -- and that reproduction IS the negative control.
+
+// NINFER_TERNARY_KVMEM_ACTION_LRFU=1  (upstream: --kvmem-action-lrfu, default off)
+[[nodiscard]] inline bool kvmem_actkv_lrfu_enabled() noexcept {
+    static const bool on =
+        kvmem_score_env_flag("NINFER_TERNARY_KVMEM_ACTION_LRFU", false);
+    return on;
+}
+
+// NINFER_TERNARY_KVMEM_LRFU_LAMBDA (upstream: --kvmem-lrfu-lambda, default 0.50)
+// NINFER_TERNARY_KVMEM_LRFU_TOP_FRAC (upstream: --kvmem-lrfu-top-frac, default 0.90)
+//
+// Both default to the v1.3 measured values. They come from the 262k NIAH round in v1.3's own
+// `docs/actkv-retention-flags.md` (which is NOT part of the patch), so they are a STARTING POINT
+// for this tree rather than a calibrated pair -- this fork's pages are different from v1.3's, so
+// the values must be re-calibrated locally before they are trusted (see the report's open items).
+[[nodiscard]] inline double kvmem_actkv_lrfu_lambda() noexcept {
+    static const double value = [] {
+        const char* text = std::getenv("NINFER_TERNARY_KVMEM_LRFU_LAMBDA");
+        if (text == nullptr || text[0] == '\0') { return 0.50; }
+        char* end = nullptr;
+        const double parsed = std::strtod(text, &end);
+        if (end == text || *end != '\0' || !(parsed > 0.0) || !(parsed < 1.0)) {
+            std::fprintf(stderr,
+                         "kvmem_actkv: NINFER_TERNARY_KVMEM_LRFU_LAMBDA=%s is outside (0,1); "
+                         "falling back to 0.50\n",
+                         text);
+            return 0.50;
+        }
+        return parsed;
+    }();
+    return value;
+}
+
+[[nodiscard]] inline double kvmem_actkv_lrfu_top_frac() noexcept {
+    static const double value = [] {
+        const char* text = std::getenv("NINFER_TERNARY_KVMEM_LRFU_TOP_FRAC");
+        if (text == nullptr || text[0] == '\0') { return 0.90; }
+        char* end = nullptr;
+        const double parsed = std::strtod(text, &end);
+        if (end == text || *end != '\0' || !(parsed > 0.0) || !(parsed <= 1.0)) {
+            std::fprintf(stderr,
+                         "kvmem_actkv: NINFER_TERNARY_KVMEM_LRFU_TOP_FRAC=%s is outside (0,1]; "
+                         "falling back to 0.90\n",
+                         text);
+            return 0.90;
+        }
+        return parsed;
+    }();
+    return value;
+}
+
+// NINFER_TERNARY_KVMEM_RETRIEVAL_TEMPERATURE (upstream: --kvmem-retrieval-temperature, default 0)
+// 0 keeps the raw cosine scale, so the default path is byte-identical to before the switch.
+[[nodiscard]] inline double kvmem_actkv_retrieval_temperature() noexcept {
+    static const double value = [] {
+        const char* text = std::getenv("NINFER_TERNARY_KVMEM_RETRIEVAL_TEMPERATURE");
+        if (text == nullptr || text[0] == '\0') { return 0.0; }
+        char* end = nullptr;
+        const double parsed = std::strtod(text, &end);
+        if (end == text || *end != '\0' || !(parsed >= 0.0)) {
+            std::fprintf(stderr,
+                         "kvmem_actkv: NINFER_TERNARY_KVMEM_RETRIEVAL_TEMPERATURE=%s is not "
+                         "non-negative; falling back to 0 (raw cosine scale)\n",
+                         text);
+            return 0.0;
+        }
+        return parsed;
+    }();
+    return value;
+}
+
+// NINFER_TERNARY_KVMEM_PROTECT_SEMANTICS=1  (upstream: --kvmem-protect-semantics, default off)
+[[nodiscard]] inline bool kvmem_actkv_protect_enabled() noexcept {
+    static const bool on =
+        kvmem_score_env_flag("NINFER_TERNARY_KVMEM_PROTECT_SEMANTICS", false);
+    return on;
+}
+
+// A diagnostic-only switch, mirroring upstream's KVMEM_PROTECT_TRACE.
+[[nodiscard]] inline bool kvmem_actkv_trace() noexcept {
+    static const bool on = kvmem_score_env_flag("NINFER_TERNARY_KVMEM_ACTKV_TRACE", false);
+    return on;
+}
+
+// The one LRFU accumulator for this lane. Process-global for the same reason every other piece of
+// this probe is (mean-K index, score buffer): it is meaningful only under --max-concurrency 1.
+// A per-lane form is what a multi-lane build would need, and that is stated rather than implied.
+[[nodiscard]] inline ops::actkv::LrfuState& kvmem_actkv_lrfu_state() {
+    static ops::actkv::LrfuState state{ops::actkv::LrfuConfig{
+        kvmem_actkv_lrfu_lambda(), kvmem_actkv_lrfu_top_frac(),
+        kvmem_actkv_retrieval_temperature(), /*deferred=*/true}};
+    return state;
+}
+
+// ---- ActKV Sec. 8.1 protected spans --------------------------------------------------------------
+//
+// The two never-compress spans, published per REQUEST by the frontend (frontend.cpp already knows
+// both frontiers in token space -- it uses them for the query span). Absolute token indices, the
+// same coordinate system `abs_query_begin/end` uses.
+//
+// Published unconditionally on every request, `-1` included: a request that yields no instruction
+// prefix (or no user turn) must CLEAR a stale span instead of inheriting the previous request's.
+// That inheritance bug is already recorded in this file for the query span, and the same failure
+// here would pin hot but unrelated pages.
+struct KvMemProtectSpans {
+    std::int32_t instruction_begin = -1;
+    std::int32_t instruction_end   = -1;
+    std::int32_t task_begin        = -1;
+    std::int32_t task_end          = -1;
+    std::int32_t total_tokens      = 0;
+};
+
+[[nodiscard]] inline KvMemProtectSpans& kvmem_actkv_spans() {
+    static KvMemProtectSpans spans;
+    return spans;
+}
+
+inline void kvmem_publish_protect_spans(std::int32_t instruction_begin,
+                                        std::int32_t instruction_end,
+                                        std::int32_t task_begin, std::int32_t task_end,
+                                        std::int32_t total_tokens) noexcept {
+    KvMemProtectSpans& spans = kvmem_actkv_spans();
+    spans.instruction_begin = instruction_begin;
+    spans.instruction_end   = instruction_end;
+    spans.task_begin        = task_begin;
+    spans.task_end          = task_end;
+    spans.total_tokens      = total_tokens;
+}
+
+// The pages the current request's protection covers, or empty when the switch is off / the spans
+// are unusable. `first_block` is added so the page ids come back in the same id space the
+// selector uses (the selector's `scores` array starts at `first_block`, and for every caller in
+// this tree `first_block` is 0 -- the parameter exists so this cannot silently mean the wrong
+// thing if that ever changes).
+[[nodiscard]] inline std::vector<std::uint32_t> kvmem_actkv_protected_pages(
+    std::int32_t page_tokens, std::int32_t first_block) {
+    std::vector<std::uint32_t> pages;
+    if (!kvmem_actkv_protect_enabled()) { return pages; }
+    const KvMemProtectSpans& spans = kvmem_actkv_spans();
+    if (spans.total_tokens <= 0) { return pages; }
+    const actkv::ProtectSpan instruction{spans.instruction_begin, spans.instruction_end};
+    const actkv::ProtectSpan task{spans.task_begin, spans.task_end};
+    pages = actkv::semantic_pages(instruction, task, page_tokens, spans.total_tokens);
+    if (first_block > 0) {
+        for (std::uint32_t& page : pages) {
+            if (page < static_cast<std::uint32_t>(first_block)) { page = 0; continue; }
+            page -= static_cast<std::uint32_t>(first_block);
+        }
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    }
+    return pages;
+}
+
 // ---- 探针状态（进程级单例，与 mean-K 索引同寿命）---------------------------------------------
 struct KvMemScoreProbe {
     // device 缓冲
@@ -503,7 +674,27 @@ inline void kvmem_score_finish(const char* label, std::int32_t query_tokens,
     scfg.budget_blocks = budget_tokens / p.block_tokens;
     scfg.sink_blocks   = sink_tokens / p.block_tokens;
     scfg.recent_blocks = recent_tokens / p.block_tokens;
-    const KvMemSelectResult sel = ops::kvmem_select_blocks(scfg, p.score_host.data(), 0);
+    // ---- ActKV policy (Sec. 5.2 LRFU + Sec. 8.1 protection), off by default ------------------
+    //
+    // The LRFU evidence for this round is handed over BEFORE the selection and committed AFTER it,
+    // which is the whole point of the two-phase form: the returned `sel.kept` is exactly the set
+    // allowed to grow, so a block the retrieval scored but the budget dropped does not accumulate
+    // heat on a slot it never won. Both calls are no-ops when the switch is off.
+    ops::actkv::LrfuState* lrfu = nullptr;
+    if (kvmem_actkv_lrfu_enabled()) {
+        lrfu = &kvmem_actkv_lrfu_state();
+        lrfu->begin_round(p.score_host.data(), static_cast<std::size_t>(p.n_blocks));
+    }
+    std::vector<std::uint32_t> protected_pages;
+    if (kvmem_actkv_protect_enabled()) {
+        protected_pages = kvmem_actkv_protected_pages(p.block_tokens, 0);
+    }
+    KvMemActKvInputs actkv;
+    actkv.lrfu            = lrfu;
+    actkv.protected_pages = protected_pages.empty() ? nullptr : &protected_pages;
+    actkv.trace           = kvmem_actkv_trace();
+    const KvMemSelectResult sel = ops::kvmem_select_blocks(scfg, p.score_host.data(), 0, actkv);
+    if (lrfu != nullptr) { lrfu->commit(sel.kept); }
     // LOCAL (2026-10-02, the caller step): publish the selection for the ring. Written AFTER the
     // selector returns and only when this chunk really scored, so a failed/skipped round leaves the
     // previous selection intact instead of emptying it.
@@ -527,6 +718,20 @@ inline void kvmem_score_finish(const char* label, std::int32_t query_tokens,
             std::fprintf(stderr, " %d", static_cast<int>(sel.kept[i]));
         }
         std::fprintf(stderr, "\n");
+    }
+
+    // ★ ActKV evidence (2026-10-16): one line per scoring round when either ActKV mechanism is on,
+    //   so "the policy is off" and "the policy is on but had nothing to do" are distinguishable in
+    //   the log. Reported AFTER the commit, so `rounds` counts this round. Absent from the log
+    //   entirely when both switches are off -- an OFF arm must not gain a new line.
+    if (kvmem_actkv_lrfu_enabled() || kvmem_actkv_protect_enabled()) {
+        std::fprintf(stderr, "kvmem_score: ACTKV lrfu=%s protect=%s %s\n",
+                     kvmem_actkv_lrfu_enabled() ? "on" : "off",
+                     kvmem_actkv_protect_enabled() ? "on" : "off",
+                     lrfu != nullptr
+                         ? kvmem_actkv_lrfu_state().describe(static_cast<std::size_t>(p.n_blocks))
+                               .c_str()
+                         : "lrfu n/a");
     }
 
     std::fprintf(stderr,

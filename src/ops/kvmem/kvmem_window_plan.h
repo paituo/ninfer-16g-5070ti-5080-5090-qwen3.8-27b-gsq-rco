@@ -17,6 +17,7 @@
 // 规格与判据：E:\infer-build\exp\mem-arm\PATCH-arm-assembly.md
 
 #include "core/paged_kv_cache.h"          // kPagedKVPageSize（判据的块大小；house rule：不写死 64）
+#include "ops/kvmem/kvmem_score.h"        // ActKV 策略开关/保护页（单一读取点）；无环：score.h 不含本头
 #include "ops/kvmem/kvmem_select.h"
 #include "ops/kvmem/kvmem_window_assembly.h" // BlockPageMap：计划侧的"块→槽"证据
 
@@ -278,7 +279,28 @@ kvmem_window_decide(const float* scores, std::int32_t scored_blocks, std::int32_
     // ②：无信号段 + 至少最新一块（"问"所在的尾块）必须在窗里。
     config.recent_blocks = std::max(recent_env, std::max(1, total_blocks - scored_blocks));
 
-    out.selection = kvmem_select_blocks(config, buf.data(), 0);
+    // ---- ActKV policy (Sec. 5.2 LRFU + Sec. 8.1 protection), off by default ------------------
+    //
+    // This is the arm that actually decides the VISIBLE window, so it is the path where both
+    // mechanisms have to be wired; the probe in kvmem_score.h is the diagnostic twin. Same
+    // two-phase order as there: evidence in, selection out, commit -- and both are no-ops with the
+    // switches off, so the OFF arm reproduces its previous selection exactly.
+    ops::actkv::LrfuState* lrfu = nullptr;
+    if (kvmem_actkv_lrfu_enabled()) {
+        lrfu = &kvmem_actkv_lrfu_state();
+        lrfu->begin_round(buf.data(), static_cast<std::size_t>(total_blocks));
+    }
+    std::vector<std::uint32_t> protected_pages;
+    if (kvmem_actkv_protect_enabled()) {
+        protected_pages = kvmem_actkv_protected_pages(block_tokens, 0);
+    }
+    KvMemActKvInputs actkv;
+    actkv.lrfu            = lrfu;
+    actkv.protected_pages = protected_pages.empty() ? nullptr : &protected_pages;
+    actkv.trace           = kvmem_actkv_trace();
+
+    out.selection = kvmem_select_blocks(config, buf.data(), 0, actkv);
+    if (lrfu != nullptr) { lrfu->commit(out.selection.kept); }
     out.valid     = !out.selection.kept.empty();
 
     // ③：负控排除表的硬核对（排除了还进窗 = 负控是假的，当场喊）。

@@ -1462,4 +1462,13 @@ void kvmem_publish_query_span(std::int32_t begin, std::int32_t end) noexcept {
     ops::detail::kvmem_score_set_query_span(begin, end);
 }
 
+// LOCAL (ActKV Sec. 8.1 semantic protection, 2026-10-16): the definition behind the declaration in
+// frontend/prepared_prompt.h. Same placement rationale as kvmem_publish_query_span above.
+void kvmem_publish_protect_spans(std::int32_t instruction_begin, std::int32_t instruction_end,
+                                 std::int32_t task_begin, std::int32_t task_end,
+                                 std::int32_t total_tokens) noexcept {
+    ops::detail::kvmem_publish_protect_spans(instruction_begin, instruction_end, task_begin,
+                                            task_end, total_tokens);
+}
+
 } // namespace ninfer::models::qwen3_5
