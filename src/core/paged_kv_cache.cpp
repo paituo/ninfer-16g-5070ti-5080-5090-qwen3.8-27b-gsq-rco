@@ -525,7 +525,55 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
 DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& reservation,
                                                     const char* tag) {
     if (!reservation.belongs_to(*this) || reservation.pages_ == 0) {
+        // LEDGER B01 WATCH (2026-10-17): deliberately NOT reclassified yet. This branch is the
+        // remaining std::invalid_argument of the B01 family (materialize()'s capacity checks at
+        // :446 and :395 already throw ContextCacheExhausted); a logic_error here escapes the
+        // worker's std::bad_alloc-only catch (engine_core.h:2413) and stops the Engine, which is
+        // how one unaffordable restore became HTTP 503 for every request after it. Whether THIS
+        // site is capacity-class (like its siblings) or genuinely an invariant violation is the
+        // open question, so the verdict is left alone and the evidence is collected instead:
+        // which caller reaches it, with what counters, and how often. The owner bit is reported
+        // separately because it is the only part that is unambiguously an invariant violation.
+        // Evidence before classification -- same discipline as the B01 investigation itself.
+        std::fprintf(stderr,
+                     "[diag] materialize-one EMPTY-RESERVATION tag=%s owner_ok=%d pages=%u "
+                     "usable=%u allocated=%u reserved=%u lent=%u capacity=%u\n",
+                     tag != nullptr ? tag : "(null)",
+                     reservation.belongs_to(*this) ? 1 : 0, reservation.pages_, usable_pages(),
+                     allocated_pages_, reserved_pages_, lent_pages_, capacity_pages());
         throw std::invalid_argument("Paged KV single-page materialization exceeds reservation");
+    }
+    if (allocated_pages_ >= usable_pages()) {
+        // LOCAL FIX (B01 arithmetic parity): materialize() has always gated on
+        // `count > usable_pages() - allocated_pages_` (:426) BEFORE it touches free_page_runs_, but
+        // this single-page path only checked `free_page_runs_.empty()` (:546). The two paths are
+        // therefore not equivalent: a reservation may be sized logically (allow_logical_reservation,
+        // DeviceKVPagePoolSpec:85, and can_resize_reservation returns true unconditionally for it,
+        // :382) beyond what the physical pool can back, and then this loop will happily drain every
+        // free run and keep handing out page leases past usable_pages(). Reproduced in
+        // tests/core/test_paged_kv_one_page_capacity.cpp (Case C): a 4-page pool with a logically
+        // grown reservation of 8 yielded taken=8 refused=0, while the batch path refused with
+        // `refused=1 materialized=0`. A pool that hands out more physical pages than it owns
+        // corrupts `allocated_pages_`/`reserved_pages_` and is a capacity condition, not an
+        // invariant violation, so it is thrown exactly like its siblings: as ContextCacheExhausted
+        // (a std::bad_alloc, include/ninfer/types.h:867) so the worker's out-of-memory path fails
+        // only this request instead of stopping the Engine (ledger B01 / iron rule 17).
+        // The diagnostic line is kept in the same shape as the free-run branch below, because
+        // "which caller, with what counters" is what the ledger needs to attribute the failure.
+        std::fprintf(stderr,
+                     "[diag] materialize-one NO-CAPACITY tag=%s usable=%u allocated=%u reserved=%u "
+                     "lent=%u capacity=%u reservation=%u\n",
+                     tag != nullptr ? tag : "(null)", usable_pages(), allocated_pages_,
+                     reserved_pages_, lent_pages_, capacity_pages(), reservation.pages_);
+        throw ContextCacheExhausted(
+            std::string("Paged KV pool has no capacity for ") +
+            (tag != nullptr ? tag : "an unnamed materialization") + ": usable " +
+            std::to_string(usable_pages()) + " (capacity " + std::to_string(capacity_pages()) +
+            ", lent " + std::to_string(lent_pages_) + "), allocated " +
+            std::to_string(allocated_pages_) + ", reserved " + std::to_string(reserved_pages_) +
+            " of which this reservation " + std::to_string(reservation.pages_) +
+            " -- capacity exhaustion on the single-page path, aligned with materialize() at "
+            "paged_kv_cache.cpp:426");
     }
     if (free_page_runs_.empty()) {
         // Which caller hit the wall matters as much as the counters: host restore, logical
